@@ -596,49 +596,76 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
         (K_h2, k_VKQ_0, k_KQ_0, KV_tmp, stride_K2, k_VKQ_sup);
     __syncthreads();
 
-#ifdef FAST_FP16_AVAILABLE
-    static_assert((nbatch_K/2) % cpy_ne == 0, "bad nbatch_K");
-#pragma unroll
-    for (int k_KQ_1 = 0; k_KQ_1 < nbatch_K/2; k_KQ_1 += cpy_ne) {
-        __align__(16) half2 K_k[nbatch_fa/(np*warp_size)][cpy_ne];
-        __align__(16) half2 Q_k[cpw][cpy_ne];
+#if defined(FAST_FP16_AVAILABLE) && !defined(V_DOT2_F32_F16_AVAILABLE)
+    // Without v_dot2_f32_f16 each ggml_cuda_mad(float, half2, half2) needs a conversion to FP32 (5 instructions for 2 values).
+    // Instead, sum up a few products in FP16 and only convert that partial sum to FP32:
+    // On P100 (cpy_ne == 2) 8 loads == 32 products per partial sum is the fastest, the perplexity is unchanged.
+    constexpr int nchain_max = 8; // Loads of cpy_nb bytes per K/Q row and iteration.
+    constexpr int nchain = (nbatch_K/2) % (nchain_max*cpy_ne) == 0 ? nchain_max : ((nbatch_K/2) % (2*cpy_ne) == 0 ? 2 : 1);
 #else
-    static_assert(nbatch_K % cpy_ne == 0, "bad nbatch_K");
+    constexpr int nchain = 1;
+#endif // defined(FAST_FP16_AVAILABLE) && !defined(V_DOT2_F32_F16_AVAILABLE)
+    constexpr int ne_step = nchain*cpy_ne;
+
+#ifdef FAST_FP16_AVAILABLE
+    static_assert((nbatch_K/2) % ne_step == 0, "bad nbatch_K");
 #pragma unroll
-    for (int k_KQ_1 = 0; k_KQ_1 < nbatch_K; k_KQ_1 += cpy_ne) {
-        __align__(16) float K_k[nbatch_fa/(np*warp_size)][cpy_ne];
-        __align__(16) float Q_k[cpw][cpy_ne];
+    for (int k_KQ_1 = 0; k_KQ_1 < nbatch_K/2; k_KQ_1 += ne_step) {
+        __align__(16) half2 K_k[nbatch_fa/(np*warp_size)][ne_step];
+        __align__(16) half2 Q_k[cpw][ne_step];
+#else
+    static_assert(nbatch_K % ne_step == 0, "bad nbatch_K");
+#pragma unroll
+    for (int k_KQ_1 = 0; k_KQ_1 < nbatch_K; k_KQ_1 += ne_step) {
+        __align__(16) float K_k[nbatch_fa/(np*warp_size)][ne_step];
+        __align__(16) float Q_k[cpw][ne_step];
 #endif // FAST_FP16_AVAILABLE
 
 #pragma unroll
         for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
             const int i_KQ = i_KQ_0 + (threadIdx.y % np)*warp_size + threadIdx.x;
 
+#pragma unroll
+            for (int l = 0; l < nchain; ++l) {
 #ifdef FAST_FP16_AVAILABLE
-            ggml_cuda_memcpy_1<cpy_nb>(&K_k[i_KQ_0/(np*warp_size)], &KV_tmp[i_KQ*(nbatch_K/2 + cpy_ne) + k_KQ_1]);
+                ggml_cuda_memcpy_1<cpy_nb>(&K_k[i_KQ_0/(np*warp_size)][l*cpy_ne], &KV_tmp[i_KQ*(nbatch_K/2 + cpy_ne) + k_KQ_1 + l*cpy_ne]);
 #else
-            ggml_cuda_memcpy_1<cpy_nb>(&K_k[i_KQ_0/(np*warp_size)], &KV_tmp[i_KQ*(nbatch_K   + cpy_ne) + k_KQ_1]);
+                ggml_cuda_memcpy_1<cpy_nb>(&K_k[i_KQ_0/(np*warp_size)][l*cpy_ne], &KV_tmp[i_KQ*(nbatch_K   + cpy_ne) + k_KQ_1 + l*cpy_ne]);
 #endif // FAST_FP16_AVAILABLE
+            }
         }
 #pragma unroll
         for (int jc0 = 0; jc0 < cpw; ++jc0) {
             const int jc = jc0 + (threadIdx.y / np)*cpw;
 
+#pragma unroll
+            for (int l = 0; l < nchain; ++l) {
 #ifdef FAST_FP16_AVAILABLE
-            ggml_cuda_memcpy_1<cpy_nb>(&Q_k[jc0], &Q_tmp[jc*(DKQ/2) + k_KQ_0/2 + k_KQ_1]);
+                ggml_cuda_memcpy_1<cpy_nb>(&Q_k[jc0][l*cpy_ne], &Q_tmp[jc*(DKQ/2) + k_KQ_0/2 + k_KQ_1 + l*cpy_ne]);
 #else
-            ggml_cuda_memcpy_1<cpy_nb>(&Q_k[jc0], &Q_tmp[jc* DKQ    + k_KQ_0   + k_KQ_1]);
+                ggml_cuda_memcpy_1<cpy_nb>(&Q_k[jc0][l*cpy_ne], &Q_tmp[jc* DKQ    + k_KQ_0   + k_KQ_1 + l*cpy_ne]);
 #endif // FAST_FP16_AVAILABLE
+            }
         }
 
 #pragma unroll
         for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
 #pragma unroll
             for (int jc0 = 0; jc0 < cpw; ++jc0) {
+#if defined(FAST_FP16_AVAILABLE) && !defined(V_DOT2_F32_F16_AVAILABLE)
+                half2 sum = K_k[i_KQ_0/(np*warp_size)][0] * Q_k[jc0][0];
 #pragma unroll
-                for (int k = 0; k < cpy_ne; ++k) {
+                for (int k = 1; k < ne_step; ++k) {
+                    sum = __hfma2(K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k], sum);
+                }
+                const float2 sumf = __half22float2(sum);
+                KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0] += sumf.x + sumf.y;
+#else
+#pragma unroll
+                for (int k = 0; k < ne_step; ++k) {
                     ggml_cuda_mad(KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0], K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k]);
                 }
+#endif // defined(FAST_FP16_AVAILABLE) && !defined(V_DOT2_F32_F16_AVAILABLE)
             }
         }
     }
