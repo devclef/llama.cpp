@@ -3,7 +3,24 @@
 Hardware: 2x Tesla P100-PCIE-16GB (sm_60), 2x Xeon Gold 6126, 512GB DDR4, CUDA 12.4.
 Model: `Qwen3.8-27B-UD-Q4_K_XL` (qwen35 hybrid: 16 full-attention + 48 Gated DeltaNet layers, D=256, GQA 6).
 
-## Headline (llama-server, 262k context, same requests)
+## Round 3 summary (final, `~/run-p100-v3.sh` on the server)
+
+llama-bench, 27B, `-sm tensor`, q8_0 KV, ub 2048 (v1 = round 1 build, v3 = final):
+
+| test | v1 | v3 | change |
+|---|---:|---:|---:|
+| pp16 (agent follow-up size) | 39 | 66 | +68% |
+| pp32 | 62 | 88 | +42% |
+| pp2048 | 374 | 394 | +5% |
+| tg128 | 20.8 | 21.0 | |
+| pp16 @ 92k depth | 30 | 46 | +51% |
+| pp2048 @ 92k depth | 165 | 233 | +41% |
+| tg128 @ 92k depth | 14.3 | 18.0 | +26% |
+
+Agent turn at 35k context (25 token follow-up + 16 generated tokens): 3.9 s -> 2.3 s wall (prompt part 2.1 s -> 1.0 s).
+Perplexity at 16k context unchanged (2.6291 -> 2.6283 +/- 0.027).
+
+## Headline round 1 (llama-server, 262k context, same requests)
 
 | scenario (server, ~47k context) | original setup | new setup | change |
 |---|---:|---:|---:|
@@ -28,11 +45,21 @@ llama-bench, 27B, empty context:
 
 ## Recommended server command
 
+Build with `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=60 -DGGML_CUDA_F16=1 -DGGML_CUDA_NCCL=ON -DNCCL_ROOT=/home/dopey/nccl/build`.
+
 ```
 llama-server --model Qwen3.8-27B-UD-Q4_K_XL.gguf -np 1 -ngl 99 --fit off \
   -sm tensor --ctx-size 262144 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 \
-  --host 0.0.0.0 ... (sampling args unchanged)
+  --no-checkpoint-tail --host 0.0.0.0 ... (sampling args unchanged)
 ```
+
+- NCCL (startup warning "NCCL not compiled in"): NCCL alone is +5% pp but -6% tg on 2x P100 without P2P.
+  With NCCL compiled in this branch uses NCCL only for tensors >= 1 MiB (prompt processing) and the internal AllReduce below that.
+- `--no-checkpoint-tail` (new): one context checkpoint per request at the last user message instead of three
+  (the hybrid model's recurrent state cannot be rolled back, the server snapshots 150 MB of state per checkpoint and splits the prompt there).
+- CPU turbo: the BIOS profile (Dell DAPC) sets the turbo disable bit. `cpu-turbo.service` clears it at boot (MSR 0x1a0 bit 38).
+  Only +2% tg for the 27B. Disabling C6 makes it worse (-15%), less turbo headroom.
+- No MTP: at 262k it only loads with `-ub 512` and then runs out of memory on a 108k prompt.
 
 - No `GGML_CUDA_ENABLE_UNIFIED_MEMORY`. With unified memory, CUDA reports ~521GB free per GPU, so `--fit` never shrinks anything and overflow is paged over PCIe.
 - `-sm tensor` uses both GPUs at the same time (needs the allreduce fix in this branch to be fast on Pascal).
@@ -51,7 +78,24 @@ llama-server --model Qwen3.8-27B-UD-Q4_K_XL.gguf -np 1 -ngl 99 --fit off \
    test-backend-ops MUL_MAT 1104/1104 and MUL_MAT_ID 933/933 pass.
 3. `ggml-cuda/ggml-cuda.cu`: `GGML_CUDA_FORCE_GRAPHS=1` opts into CUDA graphs on pre-Volta GPUs. That is +35% tg for the Flash-Next MoE (CPU experts) and neutral for the 27B.
 
+4. `ggml-cuda/fattn-tile.cuh`, `fattn.cu`: the tile kernel reads q8_0 K/V directly (dequantized while loading tiles, whole block per thread from aligned 32 bit loads)
+   and is used for q8_0 token generation with GQA on GPUs without dp4a: 953 -> 431 us per call (D=256, GQA 6, 64k). D=256 ncols 2 config 128 threads, occupancy 3.
+5. `ggml-cuda/fattn-tile.cuh`: K*Q products summed in FP16 in chains of up to 32 before converting to FP32 (5 instructions for 2 values before).
+   pp at depth +38-41%. All 4042 FLASH_ATTN_EXT tests pass, perplexity unchanged.
+6. `ggml-cuda/mmq.cu`: MMQ for batches of 9-48 tokens on Pascal (was dequantize whole matrix + cuBLAS skinny GEMM, `maxwell_hgemm_128x64_tn` at ~144 GB/s).
+7. `ggml-cuda/ggml-cuda.cu`: hybrid NCCL/internal AllReduce (`GGML_CUDA_ALLREDUCE_NCCL_MIN_BYTES`, default 1 MiB); pinned staging for device->host reads >= 64 KiB.
+8. `tools/server`: reuse buffers of erased context checkpoints; `--no-checkpoint-tail`.
+
 ## Things measured that did NOT help (don't retry)
+
+- MMVQ is not ALU bound on P100: removing a third of the instructions (q8_1 sums from ds instead of dp4a, SWAR -32 for q6_K) gave 0%.
+  L2 prefetch (as on DGX Spark): -5..-30%. 2x unrolled k loop: mixed. nwarps x rows_per_block sweep on the real per-GPU shapes
+  (8704x5120, 5120x8704, 5120x5120): 4x4 stays best (only iq4_xs +11% with 2x4). Effective 264-308 GB/s vs 576 GB/s raw read.
+- New Pascal GEMV prototypes for q5_K (FP32 dequant): lane-per-row 215 GB/s, warp-per-row 141 GB/s, shared memory staged 186 GB/s,
+  all slower than MMVQ (291 GB/s). At 560 GB/s the budget is ~5.7 instructions per q5_K weight, FP32 dequant needs ~9.
+- FA vector kernel with one block per KV head for all GQA heads: 1365 vs 953 us (register pressure, kernel is compute bound).
+- CUDA graphs (`GGML_CUDA_FORCE_GRAPHS=1`) with `-sm tensor` for the 27B: engaged (3870 reuses) but tg unchanged.
+- Flash-Next (MoE) after all changes and turbo: still 141 t/s pp, 7.1 t/s tg; 12/24 threads 2.8/4.5 t/s. Limited by the 48 per-layer GPU<->CPU handoffs.
 
 - Chunked Gated DeltaNet graph instead of the fused kernel: 210 vs 290 t/s pp8192, so the fused kernel is better. The GDN kernel is only ~5% of prefill time anyway.
 - Flash-attention tile kernel configs for D=256: the default (256 threads, occupancy 2, nbatch_fa 64, nbatch_K 64) is the best of 11 variants.
