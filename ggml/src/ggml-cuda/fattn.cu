@@ -710,7 +710,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             }
         } else {
-            if (Q->ne[1] <= 2) {
+            // Without dp4a the vector kernel is slow for quantized K.
+            // With fast FP16 the tile kernel is faster since it can read q8_0 directly and shares K/V loads for GQA.
+            const bool tile_q8_0 = GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_DP4A && fast_fp16_hardware_available(cc) &&
+                K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && gqa_opt_applies &&
+                ggml_cuda_fattn_tile_q8_0_supported(K->ne[0], V->ne[0], 1);
+            if (Q->ne[1] <= 2 && !tile_q8_0) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }

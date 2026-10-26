@@ -94,8 +94,39 @@ Use `numactl --interleave=all`, `-t 48`. `--no-host` (repacked CPU experts) give
 Generation is limited by CPU expert compute plus CPU<->GPU handoffs in all 48 layers (OpenMP threads idle ~73% of the time).
 **Conclusion: on this box the 27B (272 t/s pp, 18-20 t/s tg) clearly beats Flash-Next (140 t/s pp, 7 t/s tg) at 262k context.**
 
+## Round 2: live-server analysis (server left running)
+
+Real workload from the server log: agent loop at ~92k context, short appended prompts (110-460 tokens) then generation.
+Generation there is 73.5 ms/token (13.6 t/s) vs ~49 ms at empty context. Lifetime average from `/metrics`: 12.4 t/s.
+
+- **BIOS power profile is the biggest config problem.** `IA32_MISC_ENABLE` bit 38 = 1 (turbo disabled), HWP max = 26 (2.6 GHz),
+  EPP = 255 and EPB = 15 (max power saving), C6 enabled, `intel_pstate: P-states controlled by the platform` (Dell DAPC).
+  The busy launch thread runs at exactly 2600 MHz, idle cores at 1000 MHz. Turbo ratios available: 3.7 (1 core), 3.5 (2), 3.3 GHz (all).
+  Fix in BIOS / iDRAC: System Profile = Performance (turbo on, C-states off, max performance). Needs a reboot.
+- `perf` on the live main thread during generation: 55% libcuda + 27% libc (`pthread_mutex_lock` inside kernel launch), ~5% in synchronize.
+  Kernel launch microbenchmark (2.6 GHz): 7.1 us/launch on one GPU, 8.5 us alternating two GPUs, 5.3 us effective with one thread per GPU,
+  **1.6 us per kernel inside a CUDA graph**. So `GGML_CUDA_FORCE_GRAPHS=1` should be re-tested with `-sm tensor` (previous "neutral" result was not
+  measured with tensor split). Needs a server restart.
+- Decode attention with q8_0 KV (D=256, GQA 6, per GPU 12 Q / 2 KV heads, 64k context, one layer):
+  | kernel | us |
+  |---|---:|
+  | VEC, q8_0 (before) | 953 |
+  | VEC, q8_0, one block per KV head for all 6 Q heads (tried, reverted) | 1365 |
+  | TILE, q8_0 converted to f16 first (existing path) | 1755 |
+  | TILE, f16 KV | 387 |
+  | TILE, q8_0 read directly, 64 threads/block | 518 |
+  | **TILE, q8_0 read directly, 128 threads/block, occupancy 3 (this branch)** | **431** |
+  | TILE, f16 KV, 128 threads/block, occupancy 3 (this branch) | 361 |
+  The VEC kernel is compute bound on P100 (no native dp4a, 32-lane reductions per key); L2 already absorbs the GQA re-reads.
+  The q8_0 tile loader has each thread dequantize one whole block from aligned 32 bit loads (blocks are only 2 byte aligned).
+  At 92k depth this saves ~11 ms/token per GPU (expected ~13.6 -> ~16 t/s generation, not yet measured end to end).
+- Mixed KV types (f16/q8_0) are slower than both (1280 us). Thread split variants of the VEC kernel: at best -5%.
+- Flash-Next fully on CPU (`-ngl 0`): 1.0-1.4 t/s. Experts are mostly `q5_1` (`ffn_down_exps`, 27 GB), which has no CPU repack path;
+  libgomp barrier spinning is 18% of CPU time. The hybrid setup (7 t/s) is limited by per-layer GPU<->CPU handoffs, which the power-saving
+  BIOS profile makes worse (thread wake-up from C6, cores ramping from 1.0 GHz).
+
 ## Remaining ideas (not done)
 
-- Pascal-specific flash attention (the current tile kernel reaches 30% of FP16 peak).
+- Pascal-specific flash attention for prompt batches (the tile kernel reaches 30% of FP16 peak).
 - MMVQ still reaches only ~280-350GB/s of 732GB/s on P100 even after the table change. A dequant-to-half2 GEMV might do better, but the dp4a experiment suggests the limit is memory-access latency rather than ALU.
 - Put the AllReduce pinned buffers on the NUMA node of each GPU.
