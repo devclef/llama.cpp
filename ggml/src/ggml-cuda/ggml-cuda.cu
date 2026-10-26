@@ -4898,7 +4898,10 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->instances.empty()) {
-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
+        // CUDA graphs are disabled before Volta by default, GGML_CUDA_FORCE_GRAPHS=1 enables them anyway.
+        // On P100 this speeds up token generation for models with many small kernels (e.g. hybrid MoE with CPU experts).
+        static const bool force_graphs = getenv("GGML_CUDA_FORCE_GRAPHS") != nullptr;
+        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA && !force_graphs) {
             if (!graph->disable_due_to_gpu_arch && ggml_cuda_graph_debug_enabled()) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
             }
