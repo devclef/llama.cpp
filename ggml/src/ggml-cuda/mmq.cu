@@ -442,8 +442,9 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 
     if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {
         // for MoE, mmq is faster even without native dp4a
+        // for small batches it is also faster than dequantizing the whole matrix for cuBLAS (P100: 12 tokens 31 -> 53 t/s, 48 tokens 90 -> 96 t/s)
         // TODO: check if cards older than pascal might benefit from this as well
-        return cc >= GGML_CUDA_CC_PASCAL && n_experts > 0;
+        return cc >= GGML_CUDA_CC_PASCAL && (n_experts > 0 || ne11 <= 48);
     }
 
 #ifdef GGML_CUDA_FORCE_MMQ
