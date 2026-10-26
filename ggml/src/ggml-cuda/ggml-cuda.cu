@@ -849,10 +849,41 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// Device -> pageable host copies are slow, especially for many medium-sized copies (e.g. recurrent state checkpoints:
+// 150 MiB in ~600 pieces took ~180 ms on P100). Copy through a pinned staging buffer per device instead.
+static constexpr size_t GGML_CUDA_D2H_STAGING_MIN   = 64*1024;
+static constexpr size_t GGML_CUDA_D2H_STAGING_BYTES = 16*1024*1024;
+
+static void ggml_cuda_d2h_staged(const int device, void * dst, const char * src, size_t size) {
+    static std::mutex mutex;
+    static void * staging[GGML_CUDA_MAX_DEVICES] = {nullptr};
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (staging[device] == nullptr) {
+        if (cudaMallocHost(&staging[device], GGML_CUDA_D2H_STAGING_BYTES) != cudaSuccess) {
+            (void) cudaGetLastError();
+            staging[device] = nullptr;
+            CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            return;
+        }
+    }
+    for (size_t done = 0; done < size; done += GGML_CUDA_D2H_STAGING_BYTES) {
+        const size_t n = std::min(GGML_CUDA_D2H_STAGING_BYTES, size - done);
+        CUDA_CHECK(cudaMemcpyAsync(staging[device], src + done, n, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        memcpy((char *) dst + done, staging[device], n);
+    }
+}
+
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (size >= GGML_CUDA_D2H_STAGING_MIN) {
+        ggml_cuda_d2h_staged(ctx->device, data, (const char *) tensor->data + offset, size);
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -872,6 +903,10 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (n_copies == 1 && size >= GGML_CUDA_D2H_STAGING_MIN) {
+        ggml_cuda_d2h_staged(ctx->device, data, (const char *) tensor->data + offset, size);
+        return;
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1193,6 +1228,21 @@ static bool ggml_backend_cuda_comm_try_allreduce_nccl(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
     return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors);
 }
+
+// The internal AllReduce has the lower latency for small tensors (token generation),
+// NCCL the higher bandwidth for large tensors (prompt processing).
+// On 2x P100 without P2P: internal is ~6% faster for token generation, NCCL ~5% faster for prompt processing.
+static bool ggml_backend_cuda_comm_try_allreduce_hybrid(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    static const size_t threshold = [] {
+        const char * env = getenv("GGML_CUDA_ALLREDUCE_NCCL_MIN_BYTES");
+        return env ? (size_t) atoll(env) : (size_t) 1024*1024;
+    }();
+    if (ggml_nbytes(tensors[0]) < threshold && ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors)) {
+        return true;
+    }
+    return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors);
+}
 #endif // GGML_USE_NCCL
 
 static bool ggml_backend_cuda_comm_try_allreduce_internal(
@@ -1250,6 +1300,13 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
     if (rc == ncclSuccess) {
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
+        // Use the internal AllReduce for small tensors if it is available:
+        ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
+        if (ret->ar_pipeline) {
+            ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_hybrid;
+        } else {
+            (void) cudaGetLastError();
+        }
         return;
     }
 
