@@ -2668,6 +2668,16 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
+    // Buffers of erased checkpoints, reused for new ones: allocating and zeroing a fresh buffer of a few hundred MiB
+    // for every checkpoint costs more than copying the state itself (e.g. ~0.15 s vs ~0.04 s for 150 MiB).
+    std::vector<std::vector<uint8_t>> checkpoint_buffers;
+
+    void recycle_checkpoint(common_prompt_checkpoint & ckpt) {
+        if (ckpt.data_tgt.capacity() > 0 && checkpoint_buffers.size() < 4) {
+            checkpoint_buffers.push_back(std::move(ckpt.data_tgt));
+        }
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
@@ -2682,6 +2692,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
+                recycle_checkpoint(*it);
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
@@ -2697,6 +2708,7 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            recycle_checkpoint(slot.prompt.checkpoints.front());
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
@@ -2706,6 +2718,7 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                    recycle_checkpoint(*it);
                     it = slot.prompt.checkpoints.erase(it);
                 } else {
                     ++it;
@@ -2714,6 +2727,11 @@ private:
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
+
+        if (!checkpoint_buffers.empty()) {
+            cur.data_tgt = std::move(checkpoint_buffers.back());
+            checkpoint_buffers.pop_back();
+        }
 
         cur.id_task = id_task;
 
@@ -4404,7 +4422,7 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
+                        if (do_checkpoint && params_base.checkpoint_tail) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
@@ -4467,7 +4485,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || (near_prompt_end && params_base.checkpoint_tail) ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
