@@ -456,6 +456,9 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 }
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+    if (table_id == MMVQ_PARAMETERS_PASCAL && ncols_dst >= 2 && ncols_dst <= 4) {
+        return 2; // P100: fewer warps but more rows per block for small batches (speculative decoding)
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_PASCAL) {
         switch (ncols_dst) {
             case 1:
@@ -617,6 +620,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             case 2:
             case 3:
             case 4:
+                return table_id == MMVQ_PARAMETERS_PASCAL ? 4 : 2;
             case 5:
             case 6:
             case 7:
