@@ -3,7 +3,31 @@
 Hardware: 2x Tesla P100-PCIE-16GB (sm_60), 2x Xeon Gold 6126, 512GB DDR4, CUDA 12.4.
 Model: `Qwen3.8-27B-UD-Q4_K_XL` (qwen35 hybrid: 16 full-attention + 48 Gated DeltaNet layers, D=256, GQA 6).
 
-## Round 3 summary (final, `~/run-p100-v3.sh` on the server)
+## Round 4 summary (final, `~/run-p100-v4.sh` on the server)
+
+- Model **P100UD**: Unsloth UD-Q4_K_XL tensor layout re-quantized from BF16 with the Unsloth imatrix, q5_K -> q5_1 and q4_K -> q4_1
+  (`~/models/Qwen3.8-27B-P100UD.gguf`, type list next to it). On P100 at the real per-GPU shapes q5_1 is 14% and q4_1 22% faster
+  per matrix than q5_K/q4_K. KLD vs BF16 (2048 ctx, 10 chunks): UD-Q4_K_XL 0.01026, P100UD 0.01010, plain Q4_1 0.01626 (rejected).
+  18.54 GB vs 17.56 GB. tg at 92k depth 18.1 -> 19.0 t/s.
+- FA tile kernel with 6 Q columns per block for GQA 6 (one block per KV head for a token): q8_0 decode 396 -> 218 us per call at 64k.
+  tg 92k depth 18.8 -> 20.9, 196k 14.9 -> 17.7 t/s.
+- Chunked FP16 K/V conversion (port of shinbunbun/llama-cpp-p100-patches #31): 15587 -> 14731 MiB per GPU at 262k.
+- Tokenizer: cache the BPE tokens of long fragments (text between special tokens): ~0.45 s less per request at 108k context.
+- Server: with `--no-checkpoint-tail` short follow-ups are one batch with one checkpoint at its start: 25-token follow-up prompt 1.05 -> 0.82 s.
+- Agent turns at 108k context (production, final): 25-token follow-up prompt 2.12 s -> 0.85 s (start of round 3 -> v4),
+  turn with 16 generated tokens 3.86 s -> 2.16 s wall; 284-token follow-up 87.6 -> 113.4 t/s; generation at 108k 14.6-16.2 -> 16.7-17.7 t/s.
+
+Measured and rejected this round:
+- MTP at 262k now fits (`-ub 1024`) but loses: tg 14.1-15.5 vs 16.3-17.8 t/s at 58-71% acceptance, prefill -23%.
+- The 17 community patches that apply cleanly to this tree (01 vmad dp4a, 05, 07, 08, 11, 12 Q4_1 HFMA2 GEMV, 14, 16, 21, 23, 29, 30, 36-38, 40):
+  roughly neutral for this model (pp32 +5%, tg@92k +2.5%, tg -2%), not taken. Most others no longer apply to this tree.
+- MMVQ nwarps x rows sweep for q5_1/q4_1: 4x4 stays best.
+- Plain Q4_1: +15% tg but KLD 60% worse than UD-Q4_K_XL.
+- KV rotation constants on GPU (upstream #31073): < 1% expected here, not done.
+- Pascal internal AllReduce prepared as an upstream PR: worktree `../llama-pr-allreduce` (branch cuda-allreduce-pascal),
+  data in `../llama-pr-allreduce-DATA.txt` (upstream master: +13.5% pp512, +15% pp2048, +13% tg128 with -sm tensor, PPL identical).
+
+## Round 3 summary (`~/run-p100-v3.sh` on the server)
 
 llama-bench, 27B, `-sm tensor`, q8_0 KV, ub 2048 (v1 = round 1 build, v3 = final):
 
