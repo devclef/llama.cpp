@@ -18,6 +18,7 @@
 #include <forward_list>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <queue>
 #include <set>
 #include <unordered_map>
@@ -2088,6 +2089,15 @@ struct fragment_buffer_variant {
 struct llama_vocab::impl {
     uint32_t n_token_types = 0; // for BERT-style token types
 
+    // Cache for the BPE tokenization of long text fragments (the text between special tokens).
+    // In a chat each request repeats all previous messages, re-tokenizing them dominates for long conversations
+    // (e.g. ~0.5 s for 108k tokens). Fragments are tokenized independently, so reusing them is exact.
+    static constexpr size_t BPE_FRAGMENT_CACHE_MIN_CHARS = 4096;
+    static constexpr size_t BPE_FRAGMENT_CACHE_MAX_CHARS = 64*1024*1024;
+    mutable std::mutex bpe_fragment_cache_mutex;
+    mutable std::unordered_map<std::string, std::vector<llama_token>> bpe_fragment_cache;
+    mutable size_t bpe_fragment_cache_chars = 0;
+
     std::string tokenizer_model;
     std::string tokenizer_pre;
 
@@ -3895,7 +3905,30 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
 #ifdef PRETOKENIZERDEBUG
                         LLAMA_LOG_WARN("TT: (%ld %ld %ld) '%s'\n", text.length(), fragment.offset, fragment.length, text.c_str());
 #endif
-                        session->tokenize(text, output);
+                        if (text.size() < BPE_FRAGMENT_CACHE_MIN_CHARS) {
+                            session->tokenize(text, output);
+                            continue;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(bpe_fragment_cache_mutex);
+                            const auto it = bpe_fragment_cache.find(text);
+                            if (it != bpe_fragment_cache.end()) {
+                                output.insert(output.end(), it->second.begin(), it->second.end());
+                                continue;
+                            }
+                        }
+                        std::vector<llama_token> fragment_tokens;
+                        session->tokenize(text, fragment_tokens);
+                        output.insert(output.end(), fragment_tokens.begin(), fragment_tokens.end());
+                        {
+                            std::lock_guard<std::mutex> lock(bpe_fragment_cache_mutex);
+                            if (bpe_fragment_cache_chars + text.size() > BPE_FRAGMENT_CACHE_MAX_CHARS) {
+                                bpe_fragment_cache.clear();
+                                bpe_fragment_cache_chars = 0;
+                            }
+                            bpe_fragment_cache_chars += text.size();
+                            bpe_fragment_cache.emplace(std::move(text), std::move(fragment_tokens));
+                        }
                     } else { // if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_TOKEN)
                         session->append(fragment.token, output);
                     }
