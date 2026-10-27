@@ -4212,6 +4212,7 @@ private:
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                        recycle_checkpoint(*it);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
@@ -4368,6 +4369,11 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // with --no-checkpoint-tail, if the last user message starts only a few tokens into this batch
+                    // (e.g. the end of the previous answer), checkpoint at the start of the batch instead of splitting it
+                    const auto n_tokens_batch_start = slot.prompt.n_tokens();
+                    bool checkpoint_batch_start = false;
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -4413,7 +4419,11 @@ private:
                             const auto & checkpoints = slot.prompt.checkpoints;
 
                             if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
-                                break;
+                                if (!params_base.checkpoint_tail && pos == last_user_pos && pos - n_tokens_batch_start <= 16) {
+                                    checkpoint_batch_start = true;
+                                } else {
+                                    break;
+                                }
                             }
                         }
 
@@ -4485,7 +4495,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || (near_prompt_end && params_base.checkpoint_tail) ||
+                            is_last_user_message || checkpoint_batch_start || (near_prompt_end && params_base.checkpoint_tail) ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
