@@ -69,6 +69,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2, 128, 3,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 2,  64,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 5,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  64,  64)
@@ -138,6 +139,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2, 128, 3,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 3,  32,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  32, 128)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  32,  64)
@@ -1287,8 +1289,20 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     }
     constexpr bool need_f16_KV = !q8_0_KV;
 
+    // GQA ratio 6 (e.g. Qwen 3.5/3.8 27B): one block per K/V head for a single token
+    if constexpr (ncols2 == 6) {
+        GGML_ASSERT(Q->ne[1] == 1);
+        constexpr int cols_per_block = 6;
+        const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+        const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+        fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, 1, 6, use_logit_softcap, q8_0_KV>;
+        launch_fattn<DV, 1, 6>
+            (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, need_f16_KV, need_f16_KV, false, false, warp_size);
+        return;
+    }
+
 #ifdef GGML_USE_HIP
-    if constexpr (DKQ <= 128 && !q8_0_KV) {
+    if constexpr (DKQ <= 128 && !q8_0_KV && ncols2 != 6) {
         if (Q->ne[1] > 32/ncols2) {
             constexpr int cols_per_block = 64;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
@@ -1302,9 +1316,9 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
 #endif // GGML_USE_HIP
 
 #ifndef GGML_USE_HIP
-    if constexpr (DKQ <= 256 && !q8_0_KV)
+    if constexpr (DKQ <= 256 && !q8_0_KV && ncols2 != 6)
 #else
-    if constexpr (!q8_0_KV)
+    if constexpr (!q8_0_KV && ncols2 != 6)
 #endif // GGML_USE_HIP
     {
         if (Q->ne[1] > 16/ncols2) {
@@ -1318,7 +1332,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
         }
     }
 
-    if constexpr (ncols2 <= 16 && !q8_0_KV) {
+    if constexpr (ncols2 <= 16 && !q8_0_KV && ncols2 != 6) {
         if (Q->ne[1] > 8/ncols2) {
             constexpr int cols_per_block = 16;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
@@ -1330,7 +1344,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
         }
     }
 
-    if constexpr (ncols2 <= 8) {
+    if constexpr (ncols2 <= 8 && ncols2 != 6) {
         if (Q->ne[1] > 4/ncols2) {
             constexpr int cols_per_block = 8;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
@@ -1430,6 +1444,16 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     }
 
     if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
+#ifndef GGML_USE_HIP
+        // GQA ratio 6 for a single token: load each K/V value once for all 6 Q heads instead of 3 times with 2 per block.
+        // P100, q8_0 K/V, 64k context: 396 -> 218 us.
+        if constexpr (DKQ == 256 && DV == 256) {
+            if (use_gqa_opt && gqa_ratio % 6 == 0 && gqa_ratio % 4 != 0 && Q->ne[1] == 1) {
+                launch_fattn_tile_switch_ncols1<DKQ, DV, 6, use_logit_softcap, q8_0_KV>(ctx, dst);
+                return;
+            }
+        }
+#endif // GGML_USE_HIP
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap, q8_0_KV>(ctx, dst);
             return;
